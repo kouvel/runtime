@@ -398,7 +398,7 @@ namespace System.Threading
         {
             private readonly Internal.PaddingFor32 pad1;
 
-            public volatile int numOutstandingThreadRequests;
+            public int hasOutstandingThreadRequest;
 
             private readonly Internal.PaddingFor32 pad2;
         }
@@ -442,46 +442,28 @@ namespace System.Threading
             loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void EnsureThreadRequested()
         {
-            //
-            // If we have not yet requested #procs threads, then request a new thread.
-            //
-            // CoreCLR: Note that there is a separate count in the VM which has already been incremented
-            // by the VM by the time we reach this point.
-            //
-            int count = _separated.numOutstandingThreadRequests;
-            while (count < Environment.ProcessorCount)
+            // Request a thread to process work items. Only one thread is requested at any given time to avoid
+            // over-parallelization. When MarkThreadRequestSatisfied() resets this field to 0, allowing for another thread to be
+            // requested for processing work items.
+            if (Interlocked.CompareExchange(ref _separated.hasOutstandingThreadRequest, 1, 0) == 0)
             {
-                int prev = Interlocked.CompareExchange(ref _separated.numOutstandingThreadRequests, count + 1, count);
-                if (prev == count)
-                {
-                    ThreadPool.RequestWorkerThread();
-                    break;
-                }
-                count = prev;
+                ThreadPool.RequestWorkerThread();
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void MarkThreadRequestSatisfied()
         {
-            //
-            // One of our outstanding thread requests has been satisfied.
-            // Decrement the count so that future calls to EnsureThreadRequested will succeed.
-            //
-            // CoreCLR: Note that there is a separate count in the VM which has already been decremented
-            // by the VM by the time we reach this point.
-            //
-            int count = _separated.numOutstandingThreadRequests;
-            while (count > 0)
-            {
-                int prev = Interlocked.CompareExchange(ref _separated.numOutstandingThreadRequests, count - 1, count);
-                if (prev == count)
-                {
-                    break;
-                }
-                count = prev;
-            }
+            // Indicate that there is no pending request for a thread to process work items. The change needs to be visible to
+            // other threads that may request a worker thread before a work item is attempted to be dequeued by the current
+            // thread. In particular, if an enqueuer queues a work item and does not request a thread because it sees that a
+            // thread request is already outstanding, and the current thread is the last thread processing work items, the
+            // current thread must see the work item queued by the enqueuer.
+            _separated.hasOutstandingThreadRequest = 0;
+            Interlocked.MemoryBarrier();
         }
 
         public void EnqueueTimeSensitiveWorkItem(IThreadPoolWorkItem timeSensitiveWorkItem)
@@ -611,16 +593,6 @@ namespace System.Threading
         {
             ThreadPoolWorkQueue outerWorkQueue = ThreadPool.s_workQueue;
 
-            //
-            // Update our records to indicate that an outstanding request for a thread has now been fulfilled.
-            // From this point on, we are responsible for requesting another thread if we stop working for any
-            // reason, and we believe there might still be work in the queue.
-            //
-            // CoreCLR: Note that if this thread is aborted before we get a chance to request another one, the VM will
-            // record a thread request on our behalf.  So we don't need to worry about getting aborted right here.
-            //
-            outerWorkQueue.MarkThreadRequestSatisfied();
-
             // Has the desire for logging changed since the last time we entered?
             outerWorkQueue.RefreshLoggingEnabled();
 
@@ -634,7 +606,8 @@ namespace System.Threading
                 //
                 // Set up our thread-local data
                 //
-                // Use operate on workQueue local to try block so it can be enregistered
+                // Inside the try block, operate on 'workQueue' instead of 'outerWorkQueue', as 'workQueue' is local to the
+                // try block and it may be enregistered
                 ThreadPoolWorkQueue workQueue = outerWorkQueue;
                 ThreadPoolWorkQueueThreadLocals tl = workQueue.GetOrCreateThreadLocals();
                 object? threadLocalCompletionCountObject = tl.threadLocalCompletionCountObject;
@@ -644,12 +617,41 @@ namespace System.Threading
                 currentThread._executionContext = null;
                 currentThread._synchronizationContext = null;
 
+                // Before dequeuing the first work item, acknowledge that the thread request has been satisfied
+                workQueue.MarkThreadRequestSatisfied();
+
+                object? workItem;
+                {
+                    bool missedSteal = false;
+                    workItem = workQueue.Dequeue(tl, ref missedSteal);
+
+                    if (workItem == null)
+                    {
+                        //
+                        // No work.
+                        // If we missed a steal, though, there may be more work in the queue.
+                        // Instead of looping around and trying again, we'll just request another thread.  Hopefully the thread
+                        // that owns the contended work-stealing queue will pick up its own workitems in the meantime,
+                        // which will be more efficient than this thread doing it anyway.
+                        //
+                        needAnotherThread = missedSteal;
+
+                        // Tell the VM we're returning normally, not because Hill Climbing asked us to return.
+                        return true;
+                    }
+
+                    // A work item was successfully dequeued, and there may be more work items to process. Request a thread to
+                    // parallelize processing of work items, before processing more work items. Following this, it is the
+                    // responsibility of the new thread and other enqueuers to request more threads as necessary. The
+                    // parallelization may be necessary here for correctness (aside from perf) if the work item blocks for some
+                    // reason that may have a dependency on other queued work items.
+                    workQueue.EnsureThreadRequested();
+                }
+
                 //
                 // Save the start time
                 //
                 int startTickCount = Environment.TickCount;
-
-                object? workItem = null;
 
                 //
                 // Loop until our quantum expires or there is no work.
@@ -659,8 +661,6 @@ namespace System.Threading
                     if (workItem == null)
                     {
                         bool missedSteal = false;
-                        // Operate on 'workQueue' instead of 'outerWorkQueue', as 'workQueue' is local to the try block and it
-                        // may be enregistered
                         workItem = workQueue.Dequeue(tl, ref missedSteal);
 
                         if (workItem == null)
@@ -681,12 +681,6 @@ namespace System.Threading
 
                     if (workQueue.loggingEnabled && FrameworkEventSource.Log.IsEnabled())
                         FrameworkEventSource.Log.ThreadPoolDequeueWorkObject(workItem);
-
-                    //
-                    // If we found work, there may be more work.  Ask for another thread so that the other work can be processed
-                    // in parallel.  Note that this will only ask for a max of #procs threads, so it's safe to call it for every dequeue.
-                    //
-                    workQueue.EnsureThreadRequested();
 
                     //
                     // Execute the workitem outside of any finally blocks, so that it can be aborted if needed.
