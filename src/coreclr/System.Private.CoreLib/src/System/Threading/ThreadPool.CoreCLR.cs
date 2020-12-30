@@ -411,6 +411,7 @@ namespace System.Threading
         private static extern void QueueWaitCompletionNative(CompleteWaitThreadPoolWorkItem completeWaitWorkItem);
 #endif
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static void RequestWorkerThread()
         {
             if (UsePortableThreadPool)

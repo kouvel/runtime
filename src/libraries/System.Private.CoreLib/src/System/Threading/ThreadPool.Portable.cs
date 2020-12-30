@@ -85,6 +85,7 @@ namespace System.Threading
         /// <summary>
         /// This method is called to request a new thread pool worker to handle pending work.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static void RequestWorkerThread() => PortableThreadPool.ThreadPoolInstance.RequestWorker();
 
         /// <summary>

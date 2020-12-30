@@ -398,7 +398,7 @@ namespace System.Threading
         {
             private readonly Internal.PaddingFor32 pad1;
 
-            public int hasOutstandingThreadRequest;
+            public ThreadRequestAndWorkStealingState threadRequestAndWorkStealingState;
 
             private readonly Internal.PaddingFor32 pad2;
         }
@@ -442,30 +442,6 @@ namespace System.Threading
             loggingEnabled = FrameworkEventSource.Log.IsEnabled(EventLevel.Verbose, FrameworkEventSource.Keywords.ThreadPool | FrameworkEventSource.Keywords.ThreadTransfer);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal void EnsureThreadRequested()
-        {
-            // Request a thread to process work items. Only one thread is requested at any given time to avoid
-            // over-parallelization. When MarkThreadRequestSatisfied() resets this field to 0, allowing for another thread to be
-            // requested for processing work items.
-            if (Interlocked.CompareExchange(ref _separated.hasOutstandingThreadRequest, 1, 0) == 0)
-            {
-                ThreadPool.RequestWorkerThread();
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal void MarkThreadRequestSatisfied()
-        {
-            // Indicate that there is no pending request for a thread to process work items. The change needs to be visible to
-            // other threads that may request a worker thread before a work item is attempted to be dequeued by the current
-            // thread. In particular, if an enqueuer queues a work item and does not request a thread because it sees that a
-            // thread request is already outstanding, and the current thread is the last thread processing work items, the
-            // current thread must see the work item queued by the enqueuer.
-            _separated.hasOutstandingThreadRequest = 0;
-            Interlocked.MemoryBarrier();
-        }
-
         public void EnqueueTimeSensitiveWorkItem(IThreadPoolWorkItem timeSensitiveWorkItem)
         {
             Debug.Assert(ThreadPool.SupportsTimeSensitiveWorkItems);
@@ -476,7 +452,7 @@ namespace System.Threading
             }
 
             timeSensitiveWorkQueue!.Enqueue(timeSensitiveWorkItem);
-            EnsureThreadRequested();
+            _separated.threadRequestAndWorkStealingState.SetThreadRequest();
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -503,13 +479,13 @@ namespace System.Threading
             if (null != tl)
             {
                 tl.workStealingQueue.LocalPush(callback);
+                _separated.threadRequestAndWorkStealingState.SetThreadRequestAndRequiresWorkStealing();
             }
             else
             {
                 workItems.Enqueue(callback);
+                _separated.threadRequestAndWorkStealingState.SetThreadRequest();
             }
-
-            EnsureThreadRequested();
         }
 
         internal static bool LocalFindAndPop(object callback)
@@ -520,13 +496,24 @@ namespace System.Threading
 
         public object? Dequeue(ThreadPoolWorkQueueThreadLocals tl, ref bool missedSteal)
         {
+            // First try the local queue
             WorkStealingQueue localWsq = tl.workStealingQueue;
-            object? callback;
-
-            if ((callback = localWsq.LocalPop()) == null && // first try the local queue
-                !workItems.TryDequeue(out callback)) // then try the global queue
+            object? callback = localWsq.LocalPop();
+            if (callback != null)
             {
-                // finally try to steal from another thread's local queue
+                return callback;
+            }
+
+            // Then try the global queue
+            if (workItems.TryDequeue(out callback))
+            {
+                Debug.Assert(callback != null);
+                return callback;
+            }
+
+            // Then try to steal from another thread's local queue
+            if (_separated.threadRequestAndWorkStealingState.BeginWorkStealing())
+            {
                 WorkStealingQueue[] queues = WorkStealingQueueList.Queues;
                 int c = queues.Length;
                 Debug.Assert(c > 0, "There must at least be a queue for this thread.");
@@ -541,6 +528,7 @@ namespace System.Threading
                         callback = otherQueue.TrySteal(ref missedSteal);
                         if (callback != null)
                         {
+                            _separated.threadRequestAndWorkStealingState.EndWorkStealingWithSteal();
                             return callback;
                         }
                     }
@@ -548,15 +536,16 @@ namespace System.Threading
                 }
 
                 Debug.Assert(callback == null);
+                _separated.threadRequestAndWorkStealingState.EndWorkStealingWithoutSteal();
+            }
 
 #pragma warning disable CS0162 // Unreachable code detected. SupportsTimeSensitiveWorkItems may be a constant in some runtimes.
-                // No work in the normal queues, check for time-sensitive work items
-                if (ThreadPool.SupportsTimeSensitiveWorkItems)
-                {
-                    callback = TryDequeueTimeSensitiveWorkItem();
-                }
-#pragma warning restore CS0162
+            // No work in the normal queues, check for time-sensitive work items
+            if (ThreadPool.SupportsTimeSensitiveWorkItems)
+            {
+                callback = TryDequeueTimeSensitiveWorkItem();
             }
+#pragma warning restore CS0162
 
             return callback;
         }
@@ -618,7 +607,7 @@ namespace System.Threading
                 currentThread._synchronizationContext = null;
 
                 // Before dequeuing the first work item, acknowledge that the thread request has been satisfied
-                workQueue.MarkThreadRequestSatisfied();
+                workQueue._separated.threadRequestAndWorkStealingState.ClearThreadRequest();
 
                 object? workItem;
                 {
@@ -645,7 +634,7 @@ namespace System.Threading
                     // responsibility of the new thread and other enqueuers to request more threads as necessary. The
                     // parallelization may be necessary here for correctness (aside from perf) if the work item blocks for some
                     // reason that may have a dependency on other queued work items.
-                    workQueue.EnsureThreadRequested();
+                    workQueue._separated.threadRequestAndWorkStealingState.SetThreadRequest();
                 }
 
                 //
@@ -721,7 +710,9 @@ namespace System.Threading
                     //
                     int currentTickCount = Environment.TickCount;
                     if (!ThreadPool.NotifyWorkItemComplete(threadLocalCompletionCountObject, currentTickCount))
+                    {
                         return false;
+                    }
 
                     // Check if the dispatch quantum has expired
                     if ((uint)(currentTickCount - startTickCount) < DispatchQuantumMs)
@@ -760,7 +751,9 @@ namespace System.Threading
                 // thread to pick up where we left off.
                 //
                 if (needAnotherThread)
-                    outerWorkQueue.EnsureThreadRequested();
+                {
+                    outerWorkQueue._separated.threadRequestAndWorkStealingState.SetThreadRequest();
+                }
             }
         }
 
@@ -789,6 +782,241 @@ namespace System.Threading
             {
                 if (reportedStatus)
                     ThreadPool.ReportThreadStatus(isWorking: false);
+            }
+        }
+
+        private struct ThreadRequestAndWorkStealingState
+        {
+            private const uint HasThreadRequestBit = 1 << 0;
+            private const uint RequiresSingleWorkStealingBit = 1 << 1;
+            private const uint RequiresParallelWorkStealingBit = 1 << 2;
+            private const uint RequiresAnyWorkStealingMask = RequiresSingleWorkStealingBit | RequiresParallelWorkStealingBit;
+
+            private uint _state;
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public void SetThreadRequest()
+            {
+                Interlocked.MemoryBarrier();
+
+                uint state = _state;
+                if ((state & HasThreadRequestBit) == 0)
+                {
+                    SetThreadRequestSlow(state);
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            public void SetThreadRequestSlow(uint state)
+            {
+                Debug.Assert((state & HasThreadRequestBit) == 0);
+
+                while (true)
+                {
+                    uint newState = state | HasThreadRequestBit;
+
+                    uint stateBeforeUpdate = Interlocked.CompareExchange(ref _state, newState, state);
+                    if (stateBeforeUpdate == state)
+                    {
+                        break;
+                    }
+                    if ((state & HasThreadRequestBit) != 0)
+                    {
+                        return;
+                    }
+
+                    state = stateBeforeUpdate;
+                }
+
+                ThreadPool.RequestWorkerThread();
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public void SetThreadRequestAndRequiresWorkStealing()
+            {
+                Interlocked.MemoryBarrier();
+
+                uint state = _state;
+                Debug.Assert((state & RequiresAnyWorkStealingMask) != RequiresAnyWorkStealingMask);
+                if ((state & HasThreadRequestBit) == 0 || (state & RequiresAnyWorkStealingMask) == 0)
+                {
+                    SetThreadRequestAndRequiresWorkStealingSlow(state);
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            public void SetThreadRequestAndRequiresWorkStealingSlow(uint state)
+            {
+                Debug.Assert((state & HasThreadRequestBit) == 0 || (state & RequiresAnyWorkStealingMask) == 0);
+
+                while (true)
+                {
+                    uint newState = state | HasThreadRequestBit;
+                    Debug.Assert((state & RequiresAnyWorkStealingMask) != RequiresAnyWorkStealingMask);
+                    if ((state & RequiresAnyWorkStealingMask) == 0)
+                    {
+                        newState |= RequiresSingleWorkStealingBit;
+                    }
+                    else if (newState == state)
+                    {
+                        return;
+                    }
+
+                    uint stateBeforeUpdate = Interlocked.CompareExchange(ref _state, newState, state);
+                    if (stateBeforeUpdate == state)
+                    {
+                        // Need to request a thread if and only if the bit was set
+                        if ((stateBeforeUpdate & HasThreadRequestBit) != 0)
+                        {
+                            return;
+                        }
+                        break;
+                    }
+
+                    state = stateBeforeUpdate;
+                }
+
+                ThreadPool.RequestWorkerThread();
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public void ClearThreadRequest()
+            {
+                uint state = _state;
+                while (true)
+                {
+                    Debug.Assert((state & HasThreadRequestBit) != 0);
+                    uint newState = state & ~HasThreadRequestBit;
+
+                    uint stateBeforeUpdate = Interlocked.CompareExchange(ref _state, newState, state);
+                    if (stateBeforeUpdate == state)
+                    {
+                        return;
+                    }
+
+                    state = stateBeforeUpdate;
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public bool BeginWorkStealing()
+            {
+                Interlocked.MemoryBarrier();
+
+                uint state = _state;
+                if ((state & RequiresSingleWorkStealingBit) == 0)
+                {
+                    // Do work stealing if and only if parallel work stealing is required
+                    return (state & RequiresParallelWorkStealingBit) != 0;
+                }
+
+                return BeginWorkStealingSlow(state);
+            }
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            private bool BeginWorkStealingSlow(uint state)
+            {
+                Debug.Assert((state & RequiresSingleWorkStealingBit) != 0);
+
+                while (true)
+                {
+                    Debug.Assert((state & RequiresParallelWorkStealingBit) == 0);
+                    uint newState = state & ~RequiresSingleWorkStealingBit;
+
+                    uint stateBeforeUpdate = Interlocked.CompareExchange(ref _state, newState, state);
+                    if (stateBeforeUpdate == state)
+                    {
+                        return true; // do work stealing
+                    }
+                    if ((stateBeforeUpdate & RequiresSingleWorkStealingBit) == 0)
+                    {
+                        // Do work stealing if and only if parallel work stealing is required
+                        return (stateBeforeUpdate & RequiresParallelWorkStealingBit) != 0;
+                    }
+
+                    state = stateBeforeUpdate;
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public void EndWorkStealingWithoutSteal()
+            {
+                Interlocked.MemoryBarrier();
+
+                uint state = _state;
+                if ((state & RequiresParallelWorkStealingBit) != 0)
+                {
+                    EndWorkStealingWithoutStealSlow(state);
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            public void EndWorkStealingWithoutStealSlow(uint state)
+            {
+                Debug.Assert((state & RequiresParallelWorkStealingBit) != 0);
+
+                while (true)
+                {
+                    Debug.Assert((state & RequiresSingleWorkStealingBit) == 0);
+                    uint newState = state & ~RequiresParallelWorkStealingBit;
+
+                    uint stateBeforeUpdate = Interlocked.CompareExchange(ref _state, newState, state);
+                    if (stateBeforeUpdate == state || (stateBeforeUpdate & RequiresParallelWorkStealingBit) == 0)
+                    {
+                        return;
+                    }
+
+                    state = stateBeforeUpdate;
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public void EndWorkStealingWithSteal()
+            {
+                Interlocked.MemoryBarrier();
+
+                uint state = _state;
+                if ((state & RequiresParallelWorkStealingBit) != 0)
+                {
+                    Debug.Assert((state & RequiresSingleWorkStealingBit) == 0);
+                    return;
+                }
+
+                EndWorkStealingWithStealSlow(state);
+            }
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            public void EndWorkStealingWithStealSlow(uint state)
+            {
+                Debug.Assert((state & RequiresParallelWorkStealingBit) == 0);
+
+                while (true)
+                {
+                    // Parallel work stealing is only beginning now, so a thread request may also be necessary to parallelize
+                    // work item processing again
+                    Debug.Assert((state & ~(HasThreadRequestBit | RequiresAnyWorkStealingMask)) == 0);
+                    uint newState = HasThreadRequestBit | RequiresParallelWorkStealingBit;
+
+                    uint stateBeforeUpdate = Interlocked.CompareExchange(ref _state, newState, state);
+                    if (stateBeforeUpdate == state)
+                    {
+                        // Need to request a thread if and only if the bit was set
+                        if ((stateBeforeUpdate & HasThreadRequestBit) != 0)
+                        {
+                            return;
+                        }
+                        break;
+                    }
+                    if ((stateBeforeUpdate & RequiresParallelWorkStealingBit) != 0)
+                    {
+                        Debug.Assert((stateBeforeUpdate & RequiresSingleWorkStealingBit) == 0);
+                        return;
+                    }
+
+                    state = stateBeforeUpdate;
+                }
+
+                ThreadPool.RequestWorkerThread();
             }
         }
     }
