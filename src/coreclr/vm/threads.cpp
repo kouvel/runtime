@@ -7935,6 +7935,8 @@ UINT64 Thread::GetTotalThreadPoolCompletionCount()
     }
     CONTRACTL_END;
 
+    _ASSERTE(!ThreadpoolMgr::UsePortableThreadPoolForIO());
+
     bool usePortableThreadPool = ThreadpoolMgr::UsePortableThreadPool();
 
     // enumerate all threads, summing their local counts.
