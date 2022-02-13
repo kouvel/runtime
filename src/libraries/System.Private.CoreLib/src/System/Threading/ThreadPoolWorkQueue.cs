@@ -870,13 +870,21 @@ namespace System.Threading
         }
     }
 
-    internal sealed class ThreadPoolTypedWorkItemQueue<T> : IThreadPoolWorkItem
+    // A strongly typed callback for ThreadPoolTypedWorkItemQueue<T, TCallback>.
+    // This way we avoid the indirection of a delegate call.
+    public interface IThreadPoolTypedWorkItemQueueCallback<T>
+    {
+        // TODO: Make it static abstract when we can.
+        void Invoke(T item);
+    }
+
+    internal sealed class ThreadPoolTypedWorkItemQueue<T, TCallback> : IThreadPoolWorkItem where TCallback : struct, IThreadPoolTypedWorkItemQueueCallback<T>
     {
         private int _isScheduledForProcessing;
         private readonly ConcurrentQueue<T> _workItems = new ConcurrentQueue<T>();
-        private readonly Action<T> _callback;
+        private TCallback _callback;
 
-        public ThreadPoolTypedWorkItemQueue(Action<T> callback) => _callback = callback;
+        public ThreadPoolTypedWorkItemQueue(TCallback callback) => _callback = callback;
 
         public int Count => _workItems.Count;
 
@@ -925,7 +933,7 @@ namespace System.Threading
             int startTimeMs = Environment.TickCount;
             while (true)
             {
-                _callback(workItem);
+                _callback.Invoke(workItem);
 
                 if (++completedCount == uint.MaxValue ||
                     (tl.workState & ThreadPoolWorkQueueThreadLocals.WorkState.MayHaveLocalWorkItems) != 0 ||
