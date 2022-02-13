@@ -5,7 +5,6 @@ using System.Diagnostics;
 using System.Diagnostics.Tracing;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using Internal.Runtime.CompilerServices;
 
 namespace System.Threading
 {
@@ -116,7 +115,7 @@ namespace System.Threading
 
                 _nativeEvents =
                     (Interop.Kernel32.OVERLAPPED_ENTRY*)
-                    NativeMemory.Alloc((nuint)NativeEventCapacity * (nuint)Unsafe.SizeOf<Interop.Kernel32.OVERLAPPED_ENTRY>());
+                    NativeMemory.Alloc(NativeEventCapacity, (nuint)sizeof(Interop.Kernel32.OVERLAPPED_ENTRY));
                 _events = new(default);
 
                 // Thread pool threads must start in the default execution context without transferring the context, so
