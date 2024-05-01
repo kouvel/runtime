@@ -381,6 +381,12 @@ namespace System.Threading
             }
         }
 
+        internal static readonly bool s_prioritizationTest =
+            AppContextConfigHelper.GetBooleanConfig(
+                "System.Threading.ThreadPool.PrioritizationTest",
+                "DOTNET_ThreadPool_PrioritizationTest",
+                defaultValue: false);
+
         private const int ProcessorsPerAssignableWorkItemQueue = 16;
         private static readonly int s_assignableWorkItemQueueCount =
             Environment.ProcessorCount <= 32 ? 0 :
@@ -391,6 +397,7 @@ namespace System.Threading
         private int _mayHaveHighPriorityWorkItems;
 
         // SOS's ThreadPool command depends on the following names
+        internal readonly ConcurrentQueue<object> lowPriorityWorkItems = new ConcurrentQueue<object>();
         internal readonly ConcurrentQueue<object> workItems = new ConcurrentQueue<object>();
         internal readonly ConcurrentQueue<object> highPriorityWorkItems = new ConcurrentQueue<object>();
 
@@ -595,21 +602,47 @@ namespace System.Threading
         {
             Debug.Assert((callback is IThreadPoolWorkItem) ^ (callback is Task));
 
-            if (_loggingEnabled && FrameworkEventSource.Log.IsEnabled())
-                FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
-
-            ThreadPoolWorkQueueThreadLocals? tl;
-            if (!forceGlobal && (tl = ThreadPoolWorkQueueThreadLocals.threadLocals) != null)
+            if (s_prioritizationTest)
             {
-                tl.workStealingQueue.LocalPush(callback);
+                ThreadPoolWorkQueueThreadLocals? tl = ThreadPoolWorkQueueThreadLocals.threadLocals;
+                ConcurrentQueue<object> queue;
+                if (tl == null && callback is QueueUserWorkItemCallbackBase)
+                {
+                    queue = lowPriorityWorkItems;
+                }
+                else if (tl != null && !forceGlobal)
+                {
+                    EnqueueAtHighPriority(callback);
+                    return;
+                }
+                else
+                {
+                    queue = s_assignableWorkItemQueueCount > 0 && tl != null ? tl.assignedGlobalWorkItemQueue : workItems;
+                }
+
+                if (_loggingEnabled && FrameworkEventSource.Log.IsEnabled())
+                    FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
+
+                queue.Enqueue(callback);
             }
             else
             {
-                ConcurrentQueue<object> queue =
-                    s_assignableWorkItemQueueCount > 0 && (tl = ThreadPoolWorkQueueThreadLocals.threadLocals) != null
-                        ? tl.assignedGlobalWorkItemQueue
-                        : workItems;
-                queue.Enqueue(callback);
+                if (_loggingEnabled && FrameworkEventSource.Log.IsEnabled())
+                    FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
+
+                ThreadPoolWorkQueueThreadLocals? tl;
+                if (!forceGlobal && (tl = ThreadPoolWorkQueueThreadLocals.threadLocals) != null)
+                {
+                    tl.workStealingQueue.LocalPush(callback);
+                }
+                else
+                {
+                    ConcurrentQueue<object> queue =
+                        s_assignableWorkItemQueueCount > 0 && (tl = ThreadPoolWorkQueueThreadLocals.threadLocals) != null
+                            ? tl.assignedGlobalWorkItemQueue
+                            : workItems;
+                    queue.Enqueue(callback);
+                }
             }
 
             EnsureThreadRequested();
@@ -691,6 +724,12 @@ namespace System.Threading
                 }
             }
 
+            // Check for low-priority work items
+            if (s_prioritizationTest && lowPriorityWorkItems.TryDequeue(out workItem))
+            {
+                return workItem;
+            }
+
             // Try to steal from other threads' local work items
             {
                 WorkStealingQueue localWsq = tl.workStealingQueue;
@@ -750,6 +789,10 @@ namespace System.Threading
             get
             {
                 long count = (long)highPriorityWorkItems.Count + workItems.Count;
+                if (s_prioritizationTest)
+                {
+                    count += lowPriorityWorkItems.Count;
+                }
                 for (int i = 0; i < s_assignableWorkItemQueueCount; i++)
                 {
                     count += _assignableWorkItemQueues[i].Count;
@@ -1637,6 +1680,15 @@ namespace System.Threading
             foreach (object workItem in s_workQueue.workItems)
             {
                 yield return workItem;
+            }
+
+            if (ThreadPoolWorkQueue.s_prioritizationTest)
+            {
+                // Enumerate low-priority queue
+                foreach (object workItem in s_workQueue.lowPriorityWorkItems)
+                {
+                    yield return workItem;
+                }
             }
 
             // Enumerate each local queue
